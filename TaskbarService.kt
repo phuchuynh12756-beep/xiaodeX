@@ -7,7 +7,9 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.Paint
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
 import android.os.IBinder
@@ -31,7 +33,7 @@ class TaskbarService : Service() {
 
     private lateinit var wm: WindowManager
     private lateinit var bubble: ImageView
-    private var bar: View? = null          // thanh app ghim
+    private var bar: View? = null          // dock giữa đáy màn hình
     private var drawer: View? = null       // lưới tất cả ứng dụng
 
     private data class AppItem(val label: String, val pkg: String, val cls: String)
@@ -41,14 +43,26 @@ class TaskbarService : Service() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
-    private fun overlayParams(w: Int, h: Int, focusable: Boolean = false) =
+    private fun overlayParams(w: Int, h: Int) =
         WindowManager.LayoutParams(
             w, h,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            (if (focusable) 0 else WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE) or
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
             PixelFormat.TRANSLUCENT
         )
+
+    /** Nút lưới 9 chấm giống taskbar */
+    private inner class GridDots(ctx: Context) : View(ctx) {
+        private val p = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
+        override fun onDraw(c: Canvas) {
+            val w = width.toFloat()
+            val h = height.toFloat()
+            for (i in 1..3) for (j in 1..3) {
+                c.drawCircle(w / 4f * i, h / 4f * j, w * 0.065f, p)
+            }
+        }
+    }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -89,13 +103,25 @@ class TaskbarService : Service() {
             .sortedBy { it.label.lowercase() }
     }
 
-    private fun pinned(): MutableSet<String> =
-        prefs.getStringSet("pins", emptySet())!!.toMutableSet()
+    /** Lần đầu: ghim sẵn vài app quen thuộc nếu máy có */
+    private fun pinned(): MutableSet<String> {
+        if (!prefs.contains("pins")) {
+            val defaults = listOf(
+                "com.android.vending", "com.google.android.dialer", "com.android.dialer",
+                "com.google.android.youtube", "com.android.chrome"
+            ).filter { pkg -> allApps.any { it.pkg == pkg } }.toSet()
+            prefs.edit().putStringSet("pins", defaults).apply()
+            return defaults.toMutableSet()
+        }
+        return prefs.getStringSet("pins", emptySet())!!.toMutableSet()
+    }
 
     private fun togglePin(pkg: String) {
         val p = pinned()
         if (!p.remove(pkg)) p.add(pkg)
         prefs.edit().putStringSet("pins", p).apply()
+        // vẽ lại dock nếu đang mở
+        if (bar != null) { hideBar(); showBar() }
     }
 
     private fun icon(pkg: String) = try {
@@ -106,7 +132,7 @@ class TaskbarService : Service() {
 
     private fun launch(a: AppItem) {
         Root.launchFreeform(a.pkg, a.cls)
-        hideBar(); hideDrawer()
+        hideDrawer()          // dock vẫn giữ nguyên như taskbar thật
     }
 
     // ---------- bong bóng nổi trong suốt ----------
@@ -134,51 +160,58 @@ class TaskbarService : Service() {
                     if (Math.abs(dx) > 10 || Math.abs(dy) > 10) moved = true
                     lp.x = sx + dx; lp.y = sy + dy
                     wm.updateViewLayout(bubble, lp)
-                    if (bar != null) hideBar()
                 }
-                MotionEvent.ACTION_UP -> if (!moved) toggleBar(lp)
+                MotionEvent.ACTION_UP -> if (!moved) toggleBar()
             }
             true
         }
         wm.addView(bubble, lp)
     }
 
-    // ---------- thanh app ghim ----------
-    private fun toggleBar(bubbleLp: WindowManager.LayoutParams) {
-        if (bar != null) { hideBar(); hideDrawer(); return }
+    // ---------- dock giữa đáy màn hình ----------
+    private fun toggleBar() {
+        if (bar != null) { hideBar(); hideDrawer() } else showBar()
+    }
 
+    private fun showBar() {
         val row = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), dp(6), dp(8), dp(6))
+            setPadding(dp(14), dp(10), dp(14), dp(10))
         }
+
+        // nút tất cả ứng dụng (9 chấm) đứng đầu
+        row.addView(GridDots(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply {
+                marginStart = dp(4); marginEnd = dp(12)
+            }
+            setOnClickListener { if (drawer == null) showDrawer() else hideDrawer() }
+        })
+
+        // các app đã ghim; nhấn giữ để bỏ ghim
         val pins = pinned()
         allApps.filter { it.pkg in pins }.forEach { a ->
             row.addView(ImageView(this).apply {
                 setImageDrawable(icon(a.pkg))
-                layoutParams = LinearLayout.LayoutParams(dp(44), dp(44)).apply { marginEnd = dp(8) }
+                layoutParams = LinearLayout.LayoutParams(dp(48), dp(48)).apply {
+                    marginStart = dp(6); marginEnd = dp(6)
+                }
                 setOnClickListener { launch(a) }
+                setOnLongClickListener { togglePin(a.pkg); true }
             })
         }
-        // nút hiện tất cả ứng dụng
-        row.addView(ImageView(this).apply {
-            setImageResource(android.R.drawable.ic_menu_view)
-            setColorFilter(Color.WHITE)
-            layoutParams = LinearLayout.LayoutParams(dp(44), dp(44))
-            setOnClickListener { if (drawer == null) showDrawer() else hideDrawer() }
-        })
 
         val scroll = HorizontalScrollView(this).apply {
+            isHorizontalScrollBarEnabled = false
             addView(row)
             background = GradientDrawable().apply {
-                cornerRadius = dp(28).toFloat()
-                setColor(Color.argb(140, 20, 20, 20))   // nền mờ trong suốt
+                cornerRadius = dp(36).toFloat()
+                setColor(Color.argb(225, 43, 45, 49))
             }
         }
-        val lp = overlayParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(60)).apply {
-            gravity = Gravity.TOP or Gravity.START
-            x = bubbleLp.x + dp(54)
-            y = bubbleLp.y - dp(6)
+        val lp = overlayParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = dp(16)
         }
         wm.addView(scroll, lp)
         bar = scroll
@@ -189,7 +222,7 @@ class TaskbarService : Service() {
         bar = null
     }
 
-    // ---------- lưới tất cả ứng dụng ----------
+    // ---------- lưới tất cả ứng dụng (hiện phía trên dock) ----------
     private fun showDrawer() {
         val grid = GridView(this).apply {
             numColumns = 5
@@ -215,7 +248,7 @@ class TaskbarService : Service() {
                         maxLines = 1; gravity = Gravity.CENTER
                     })
                     cell.setOnClickListener { launch(a) }
-                    // nhấn giữ = ghim / bỏ ghim lên thanh
+                    // nhấn giữ = ghim / bỏ ghim lên dock
                     cell.setOnLongClickListener { togglePin(a.pkg); notifyDataSetChanged(); true }
                     return cell
                 }
@@ -224,13 +257,17 @@ class TaskbarService : Service() {
         val box = LinearLayout(this).apply {
             addView(grid, LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.MATCH_PARENT)
             background = GradientDrawable().apply {
-                cornerRadius = dp(20).toFloat()
-                setColor(Color.argb(190, 20, 20, 20))
+                cornerRadius = dp(28).toFloat()
+                setColor(Color.argb(225, 43, 45, 49))
             }
         }
         val dm = resources.displayMetrics
-        val lp = overlayParams(minOf(dm.widthPixels - dp(40), dp(460)), minOf(dm.heightPixels - dp(120), dp(420))).apply {
-            gravity = Gravity.CENTER
+        val lp = overlayParams(
+            minOf(dm.widthPixels - dp(40), dp(460)),
+            minOf(dm.heightPixels - dp(140), dp(420))
+        ).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            y = dp(96)    // nằm ngay trên dock
         }
         wm.addView(box, lp)
         drawer = box
