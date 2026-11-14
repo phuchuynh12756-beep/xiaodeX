@@ -54,7 +54,6 @@ jobs:
               kotlinOptions { jvmTarget = "17" }
           }
           EOT
-          find . -path ./.git -prune -o -type f -print
 
       - uses: actions/setup-java@v4
         with:
